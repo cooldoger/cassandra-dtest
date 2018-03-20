@@ -118,6 +118,12 @@ class TestGossipingPropertyFileSnitch(Tester):
             assert "INTERNAL_ADDRESS_AND_PORT:7:{}".format(NODE1_40_LISTEN_ADDRESS) in out
             assert "INTERNAL_ADDRESS_AND_PORT:7:{}".format(NODE1_40_LISTEN_ADDRESS) in out
 
+
+def snitchable(scores_before, scores_after, needed_nodes):
+    return all('/' + k.address() in scores_before and '/' + k.address()
+               in scores_after for k in needed_nodes)
+
+
 class TestDynamicEndpointSnitch(Tester):
     @pytest.mark.resource_intensive
     @since('3.10')
@@ -131,10 +137,6 @@ class TestDynamicEndpointSnitch(Tester):
 
         def no_cross_dc(scores, cross_dc_nodes):
             return all('/' + k.address() not in scores for k in cross_dc_nodes)
-
-        def snitchable(scores_before, scores_after, needed_nodes):
-            return all('/' + k.address() in scores_before and '/' + k.address()
-                       in scores_after for k in needed_nodes)
 
         cluster = self.cluster
         cluster.populate([3, 3])
@@ -197,3 +199,72 @@ class TestDynamicEndpointSnitch(Tester):
                 # check that most reads were snitchable, with some
                 # room allowed in case score recalculation is slow
                 assert snitchable_count >= 250
+
+
+    @since('3.10')
+    def test_multidatacenter_one(self):
+        '''
+        @jira_ticket CASSANDRA-14252
+
+        If local node is degraded, DES should take effect and route around the degraded node
+        '''
+
+        cluster = self.cluster
+        cluster.populate([1, 1])
+        degraded_node, xdc_node = cluster.nodelist()
+        # increase DES reset/update interval so we clear any cross-DC startup reads faster
+        cluster.set_configuration_options(values={'dynamic_snitch_reset_interval_in_ms': 10000,
+                                                  'dynamic_snitch_update_interval_in_ms': 50,
+                                                  'phi_convict_threshold': 12})
+        remove_perf_disable_shared_mem(xdc_node)
+        remove_perf_disable_shared_mem(degraded_node)
+        # Delay reads on the degraded node by 50 milliseconds
+        degraded_node.start(jvm_args=['-Dcassandra.test.read_iteration_delay_ms=50',
+                                      '-Dcassandra.allow_unsafe_join=true'])
+        cluster.start(wait_for_binary_proto=30, wait_other_notice=True)
+
+        des = make_mbean('db', type='DynamicEndpointSnitch')
+        read_stage = make_mbean('metrics', type='ThreadPools', path='request',
+                                scope='ReadStage', name='CompletedTasks')
+        session = self.patient_exclusive_cql_connection(degraded_node)
+        session.execute("CREATE KEYSPACE snitchtestks WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 1, 'dc2': 1}")
+        session.execute("CREATE TABLE snitchtestks.tbl1 (key int PRIMARY KEY) WITH speculative_retry = 'NONE' AND dclocal_read_repair_chance = 0.0")
+        read_stmt = session.prepare("SELECT * FROM snitchtestks.tbl1 where key = ?")
+        read_stmt.consistency_level = ConsistencyLevel.ONE
+        insert_stmt = session.prepare("INSERT INTO snitchtestks.tbl1 (key) VALUES (?)")
+        insert_stmt.consistency_level = ConsistencyLevel.ALL
+        with JolokiaAgent(degraded_node) as jmx:
+            for x in range(0, 300):
+                session.execute(insert_stmt, [x])
+
+            cleared = False
+            # Wait for a snitch reset in case any earlier
+            # startup process populated cross-DC read timings
+            while not cleared:
+                scores = jmx.read_attribute(des, 'Scores')
+                cleared = ('/127.0.0.1' in scores and (len(scores) == 1)) or not scores
+
+            snitchable_count = 0
+
+            for x in range(0, 300):
+                degraded_reads_before = jmx.read_attribute(read_stage, 'Value')
+                scores_before = jmx.read_attribute(des, 'Scores')
+                future = session.execute_async(read_stmt, [x])
+                future.result()
+                scores_after = jmx.read_attribute(des, 'Scores')
+
+                if snitchable(scores_before, scores_after,
+                              [xdc_node, degraded_node]):
+                    snitchable_count = snitchable_count + 1
+                    # If the DES correctly routed the read around the degraded node,
+                    # it shouldn't have another completed read request in metrics
+                    assert (degraded_reads_before ==
+                                 jmx.read_attribute(read_stage, 'Value'))
+                else:
+                    # sleep to give dynamic snitch time to recalculate scores
+                    time.sleep(.1)
+
+            # check that most reads were snitchable, with some
+            # room allowed in case score recalculation is slow
+            assert snitchable_count >= 250
+
