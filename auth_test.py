@@ -107,6 +107,34 @@ class TestAuth(Tester):
         except NoHostAvailable as e:
             assert isinstance(list(e.errors.values())[0], AuthenticationFailed)
 
+    @since('4.0')
+    def test_login_cache(self):
+        cluster = self.cluster
+        config = {'authenticator': 'org.apache.cassandra.auth.PasswordAuthenticator',
+                  'authorizer': 'org.apache.cassandra.auth.CassandraAuthorizer'}
+        cluster.set_configuration_options(values=config)
+        cluster.populate(1)
+        [node] = cluster.nodelist()
+        remove_perf_disable_shared_mem(node)
+        cluster.start(wait_for_binary_proto=True)
+
+        with JolokiaAgent(node) as jmx:
+            roles_table = make_mbean('metrics', type='Table', keyspace='system_auth', scope='roles',
+                                     name='ReadLatency')
+            query_count_before = jmx.read_attribute(roles_table, 'Count')
+            self.get_session(user='cassandra', password='cassandra')
+            query_count_after = jmx.read_attribute(roles_table, 'Count')
+
+            assert query_count_after > query_count_before
+            query_count_before = query_count_after
+
+            for i in range(10):
+                self.get_session(user='cassandra', password='cassandra')
+            query_count_after = jmx.read_attribute(roles_table, 'Count')
+
+            # the most of the session should be cached
+            assert query_count_after - query_count_before < 5
+
     # from 2.2 role creation is granted by CREATE_ROLE permissions, not superuser status
     @since('1.2', max_version='2.1.x')
     def test_only_superuser_can_create_users(self):
